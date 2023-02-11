@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Windows.Media.Protection.PlayReady;
 using Windows.Networking.Sockets;
@@ -13,7 +14,7 @@ namespace Pear
 {
     public static class PearDefinitions
     {
-        public const int DiscoverPort = 17002;
+        public const int Port = 17002;
         public static readonly byte[] Header = new byte[] { 0xF0, 0x9F, 0x8D, 0x90 };
     }
 
@@ -28,7 +29,7 @@ namespace Pear
         public int ProtocolVersion { get; set; }
         public string Name { get; set; } = null!;
 
-        public IEnumerable<byte> ToDackBytes()
+        public IEnumerable<byte> ToDackBytes(int version)
         {
             var name = Encoding.UTF8.GetBytes(Name);
             var staticHeader = new byte[]
@@ -60,13 +61,16 @@ namespace Pear
             Peard.Instance._self.Name = name;
 
             Debug.WriteLine("[peard] starting discovery server");
-            Peard.Instance.InitializeUdp();
+            Peard.Instance.InitializeDiscoveryServer();
+
+            Debug.WriteLine("[peard] starting receive server");
+            Peard.Instance.InitializeReceiveServer();
         }
 
         private PearDevice _self;
 
         private UdpClient _udp;
-        //private TcpListener _tcp;
+        private TcpListener _tcp;
 
         private Peard()
         {
@@ -77,13 +81,16 @@ namespace Pear
                 Name = "Unknown Device"
             };
 
-            _udp = new UdpClient(new IPEndPoint(IPAddress.Any, PearDefinitions.DiscoverPort));
+            _udp = new UdpClient(new IPEndPoint(IPAddress.Any, PearDefinitions.Port));
             _udp.EnableBroadcast = true;
-            Debug.WriteLine($"[peard] pear services OK");
+            Debug.WriteLine($"[peard] udp services OK");
+
+            _tcp = new TcpListener(new IPEndPoint(IPAddress.Any, PearDefinitions.Port));
+            Debug.WriteLine($"[peard] tcp services OK");
         }
 
 
-        private void InitializeUdp()
+        private void InitializeDiscoveryServer()
         {
             var task = Task.Run(() =>
             {
@@ -91,8 +98,8 @@ namespace Pear
                 {
                     var from = new IPEndPoint(0, 0);
                     var recvBuffer = _udp.Receive(ref from);
-                    Debug.WriteLine($"[peard][udp] incoming broadcast from {from}");
-                    Debug.WriteLine($"[peard][udp] dump payload: {BitConverter.ToString(recvBuffer)}");
+                    //Debug.WriteLine($"[peard][udp] incoming broadcast from {from}");
+                    //Debug.WriteLine($"[peard][udp] dump payload: {BitConverter.ToString(recvBuffer)}");
                     if (recvBuffer[0] != PearDefinitions.Header[0] ||
                         recvBuffer[1] != PearDefinitions.Header[1] ||
                         recvBuffer[2] != PearDefinitions.Header[2] ||
@@ -100,29 +107,65 @@ namespace Pear
                         continue; // ignore stuff not meant for pear
                     var version = recvBuffer[4];
                     var type = recvBuffer[5]; // we can ignore this for now as we dont have any other udp types
-                    Debug.WriteLine($"[peard][udp] received DISC (version {version})");
                     // only one version exists right now so thats all i care about
 
                     // next up is the device ID. im going to just use 64 bytes
                     // well, im using just 4 for testing for now
                     var id = recvBuffer[6..9];
 
+                    Debug.WriteLine($"[peard][udp] received DISC from device {BitConverter.ToInt64(id)} (version {version})");
+
                     // and i do not care about the rest of it right now
                     // signing? identities? pfft who needs em
 
+                    // [TODO]: make this safe from the server breaking
+
                     var client = new TcpClient();
-                    client.Connect(from);
-                    var stream = client.GetStream();
-                    var data = _self.ToDackBytes().ToArray();
-                    stream.Write(data, 0, data.Length);
-                    Debug.WriteLine("[peard][tcp] wrote DACK");
-                    client.Close();
+                    try
+                    {
+                        client.Connect(from);
+                        var stream = client.GetStream();
+                        // generate DACK byte array for requested protocol version
+                        var data = _self.ToDackBytes(version).ToArray();
+                        stream.Write(data, 0, data.Length);
+                        Debug.WriteLine("[peard][tcp] wrote DACK");
+                    }
+                    finally
+                    {
+                        client.Close();
+                    }
                 }
             });
         }
 
-        private void DISC_Recv()
+        private void InitializeReceiveServer()
         {
+            var task = Task.Run(() =>
+            {
+                _tcp.Start();
+                try
+                {
+                    while (true)
+                    {
+                        TcpClient client = _tcp.AcceptTcpClient();
+
+                        Thread t = new Thread(new ParameterizedThreadStart(HandleTcp));
+                        t.Start(client);
+                    }
+                }
+                finally
+                {
+                    _tcp.Stop();
+                }
+            });
+        }
+
+        private void HandleTcp(object? param)
+        {
+            if (param == null)
+                return;
+            var client = (TcpClient)param;
+
 
         }
     }
